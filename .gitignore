@@ -38,3 +38,6 @@ session.json.enc
 # Environment overrides
 .env
 .env.local
+
+# Local dev Cargo path overrides (never commit — breaks CI)
+.cargo/config.toml

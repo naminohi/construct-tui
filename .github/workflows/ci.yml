@@ -18,24 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: construct-tui
+        working-directory: .
     steps:
       - name: Checkout construct-tui
         uses: actions/checkout@v4
-        with:
-          path: construct-tui
-
-      - name: Checkout construct-core
-        uses: actions/checkout@v4
-        with:
-          repository: maximeliseyev/construct-core
-          path: construct-core
-
-      - name: Checkout construct-ice
-        uses: actions/checkout@v4
-        with:
-          repository: maximeliseyev/construct-ice
-          path: construct-ice
 
       - name: Checkout construct-protos
         uses: actions/checkout@v4
@@ -56,8 +42,8 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            construct-tui/target/
-          key: linux-x64-cargo-${{ hashFiles('construct-tui/Cargo.lock') }}
+            target/
+          key: linux-x64-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: linux-x64-cargo-
 
       - name: Install system deps (OpenSSL, pkg-config, protoc)
@@ -67,9 +53,13 @@ jobs:
         run: cargo fmt -- --check
 
       - name: cargo clippy
+        env:
+          CONSTRUCT_PROTOS_DIR: ${{ github.workspace }}/construct-protos
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
+        env:
+          CONSTRUCT_PROTOS_DIR: ${{ github.workspace }}/construct-protos
         run: cargo test
 
   # ── 2. Build — Linux x86_64 ────────────────────────────────────────────────
@@ -77,26 +67,9 @@ jobs:
     name: Build Linux x86_64
     runs-on: ubuntu-latest
     needs: lint-and-test
-    defaults:
-      run:
-        working-directory: construct-tui
     steps:
       - name: Checkout construct-tui
         uses: actions/checkout@v4
-        with:
-          path: construct-tui
-
-      - name: Checkout construct-core
-        uses: actions/checkout@v4
-        with:
-          repository: maximeliseyev/construct-core
-          path: construct-core
-
-      - name: Checkout construct-ice
-        uses: actions/checkout@v4
-        with:
-          repository: maximeliseyev/construct-ice
-          path: construct-ice
 
       - name: Checkout construct-protos
         uses: actions/checkout@v4
@@ -114,51 +87,33 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            construct-tui/target/
-          key: linux-x64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
+            target/
+          key: linux-x64-cargo-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: linux-x64-cargo-
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
 
       - name: Build release
+        env:
+          CONSTRUCT_PROTOS_DIR: ${{ github.workspace }}/construct-protos
         run: cargo build --release
-
-      - name: Package artifact
-        run: mv target/release/${{ env.BIN_NAME }} ../konstrukt-linux-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: konstrukt-linux-x86_64
-          path: konstrukt-linux-x86_64
+          path: target/release/${{ env.BIN_NAME }}
           retention-days: 7
 
-  # ── 4. Build — macOS Apple Silicon ────────────────────────────────────────
+  # ── 3. Build — macOS Apple Silicon ────────────────────────────────────────
   build-macos-arm64:
     name: Build macOS arm64
     runs-on: macos-14
     needs: lint-and-test
-    defaults:
-      run:
-        working-directory: construct-tui
     steps:
       - name: Checkout construct-tui
         uses: actions/checkout@v4
-        with:
-          path: construct-tui
-
-      - name: Checkout construct-core
-        uses: actions/checkout@v4
-        with:
-          repository: maximeliseyev/construct-core
-          path: construct-core
-
-      - name: Checkout construct-ice
-        uses: actions/checkout@v4
-        with:
-          repository: maximeliseyev/construct-ice
-          path: construct-ice
 
       - name: Checkout construct-protos
         uses: actions/checkout@v4
@@ -176,27 +131,26 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            construct-tui/target/
-          key: macos-arm64-cargo-release-${{ hashFiles('construct-tui/Cargo.lock') }}
+            target/
+          key: macos-arm64-cargo-release-${{ hashFiles('Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
 
       - name: Install protoc (macOS)
         run: brew install protobuf
 
       - name: Build release
+        env:
+          CONSTRUCT_PROTOS_DIR: ${{ github.workspace }}/construct-protos
         run: cargo build --release
-
-      - name: Package artifact
-        run: mv target/release/${{ env.BIN_NAME }} ../konstrukt-macos-arm64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: konstrukt-macos-arm64
-          path: konstrukt-macos-arm64
+          path: target/release/${{ env.BIN_NAME }}
           retention-days: 7
 
-  # ── 5. GitHub Release (on tag push) ───────────────────────────────────────
+  # ── 4. GitHub Release (on tag push) ───────────────────────────────────────
   release:
     name: Publish Release
     runs-on: ubuntu-latest
@@ -218,9 +172,10 @@ jobs:
         run: |
           cd dist
           chmod +x konstrukt-*
-          for f in konstrukt-*; do
-            tar -czf "${f}.tar.gz" "$f"
-          done
+          mv konstrukt-linux-x86_64 konstrukt-linux-x86_64-bin
+          mv konstrukt-macos-arm64 konstrukt-macos-arm64-bin
+          tar -czf konstrukt-linux-x86_64.tar.gz -C . konstrukt-linux-x86_64-bin
+          tar -czf konstrukt-macos-arm64.tar.gz -C . konstrukt-macos-arm64-bin
           sha256sum *.tar.gz > SHA256SUMS
           ls -lh
 
@@ -232,4 +187,3 @@ jobs:
             dist/konstrukt-linux-x86_64.tar.gz
             dist/konstrukt-macos-arm64.tar.gz
             dist/SHA256SUMS
-

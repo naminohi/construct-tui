@@ -12,8 +12,8 @@ ice = ["construct-ice"]
 post-quantum = ["construct-core/post-quantum"]
 
 [dependencies]
-construct-core = { path = "../construct-core", features = ["desktop"] }
-construct-ice = { path = "../construct-ice", optional = true, features = ["tonic-transport"] }
+construct-core = { git = "https://github.com/maximeliseyev/construct-core.git", rev = "8085cf2", features = ["desktop"] }
+construct-ice = { git = "https://github.com/maximeliseyev/construct-obfs4.git", rev = "4657fca", optional = true, features = ["tonic-transport"] }
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }

@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = PathBuf::from("../construct-protos");
+    // Allow CI / other environments to specify the protos directory via env var.
+    // Falls back to the sibling-repo convention for local development.
+    let proto_dir = std::env::var("CONSTRUCT_PROTOS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../construct-protos"));
 
     let protos: Vec<PathBuf> = vec![
         proto_dir.join("services/auth_service.proto"),
@@ -18,8 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute(".", "#[allow(clippy::large_enum_variant, clippy::enum_variant_names, clippy::doc_lazy_continuation, dead_code)]")
         .compile_protos(&protos, &includes)?;
 
-    // Re-run if any proto changes
-    println!("cargo:rerun-if-changed=../construct-protos");
+    println!("cargo:rerun-if-changed={}", proto_dir.display());
+    println!("cargo:rerun-if-env-changed=CONSTRUCT_PROTOS_DIR");
 
     Ok(())
 }
