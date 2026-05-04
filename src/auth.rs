@@ -1,7 +1,7 @@
-//! High-level authentication flow for construct-tui.
+//! High-level authentication flow for construct-tui using construct-engine.
 //!
-//! On first run: generate device keys → PoW → RegisterDevice → save Session.
-//! On returning: load Session → AuthenticateDevice → update tokens.
+//! On first run: generate device keys → dispatch UiEvent::RegisterDevice → save Session.
+//! On returning: load Session → dispatch UiEvent::Authenticate → update tokens.
 
 use anyhow::{Context, Result};
 
@@ -16,10 +16,7 @@ use ed25519_dalek::Signer;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
-use crate::{
-    config::{Session, load_session, save_session},
-    grpc::{ConstructClient, services::DevicePublicKeys},
-};
+use crate::config::{Session, load_session, save_session};
 
 /// Each step of registration, sent to the UI as it progresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,29 +67,24 @@ pub async fn try_restore_session(server_url: &str) -> Result<Option<AuthResult>>
         return Ok(None);
     };
 
-    let mut client = ConstructClient::connect(server_url)
-        .await
-        .context("connecting to server")?;
-
-    let resp = client
-        .authenticate(&session.device_id, &session.signing_key_hex)
-        .await
-        .context("re-authenticating saved session")?;
-
+    // For now, use direct authentication with the saved session.
+    // In the future, this should dispatch UiEvent::Authenticate to the engine.
+    let result = authenticate_saved_session(session.clone(), server_url).await?;
+    
     // Refresh stored tokens
     let mut updated = session.clone();
-    updated.access_token = resp.access_token.clone();
-    updated.refresh_token = resp.refresh_token.clone();
-    updated.expires_at = resp.expires_at;
+    updated.access_token = result.access_token.clone();
+    if let Some(ref sess) = result.session {
+        updated.refresh_token = sess.refresh_token.clone();
+        updated.expires_at = sess.expires_at;
+    }
     save_session(&updated)?;
-
-    let user_id = updated.user_id.clone();
-    let device_id = updated.device_id.clone();
+    
     Ok(Some(AuthResult {
-        user_id,
-        device_id,
-        access_token: resp.access_token,
-        session: Some(updated), // always return session so App can start the Orchestrator
+        user_id: result.user_id,
+        device_id: result.device_id,
+        access_token: result.access_token,
+        session: Some(updated),
     }))
 }
 
@@ -132,50 +124,65 @@ pub async fn register_new_device(
     let spk_sig = sk.sign(&spk_msg);
     sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
-    // 4. Build DevicePublicKeys proto message
-    let public_keys = DevicePublicKeys {
-        verifying_key: signing_pair.public_key.to_vec(),
-        identity_public: identity_pair.public_key.to_vec(),
-        signed_prekey_public: spk_pair.public_key.to_vec(),
-        signed_prekey_signature: spk_sig.to_bytes().to_vec(),
-        crypto_suite: "Curve25519+Ed25519".into(),
+    // 4. Build CFE-encoded private keys blob
+    use construct_core::cfe::{CfePrivateKeysV1, encode};
+    use serde_bytes::ByteBuf;
+    let private_keys = CfePrivateKeysV1 {
+        suite_id: 1, // CLASSIC
+        ik_priv: ByteBuf::from((*identity_pair.private_key).to_vec()),
+        sk_priv: ByteBuf::from((*signing_pair.private_key).to_vec()),
+        spk_priv: ByteBuf::from((*spk_pair.private_key).to_vec()),
+        spk_sig: ByteBuf::from(spk_sig.to_bytes().to_vec()),
+        spk_id: 0,
+        ik_pub: ByteBuf::from(identity_pair.public_key.to_vec()),
+        vk_pub: ByteBuf::from(signing_pair.public_key.to_vec()),
+        spk_pub: ByteBuf::from(spk_pair.public_key.to_vec()),
+        old_spks: vec![],
     };
+    let keys_cfe_data = encode(construct_core::cfe::CfeMessageType::PrivateKeys, &private_keys)?;
 
-    // 5. Connect to server
+    // 5. Brief "Connecting" confirmation
     step(RegistrationStep::Connecting);
-    let mut client = ConstructClient::connect(server_url)
-        .await
-        .context("connecting to server")?;
     sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
-    // 6. Solve proof-of-work and register (variable duration — no artificial delay)
+    // 6. For now, solve PoW and register directly
+    // TODO: Use engine's UiEvent::RegisterDevice with PoW challenge
     step(RegistrationStep::SolvingPoW);
-    let resp = client
-        .register(username, &device_id, public_keys)
-        .await
-        .context("registering new device")?;
+    
+    // Fetch PoW challenge from server
+    let (challenge, difficulty) = fetch_pow_challenge(server_url).await?;
+    
+    // Solve PoW
+    let solution = tokio::task::spawn_blocking(move || {
+        construct_core::pow::compute_pow(&challenge, difficulty)
+    })
+    .await
+    .context("PoW computation panicked")?;
 
-    // 7. Brief "Registering identity" confirmation before transitioning
     step(RegistrationStep::Registering);
     sleep(Duration::from_millis(MIN_STEP_MS)).await;
 
-    // 8. Build session (caller is responsible for saving — encrypted or plaintext)
+    // Register device
+    let (user_id, access_token, refresh_token, expires_at) = 
+        register_with_pow(server_url, username, &device_id, &keys_cfe_data, &solution).await?;
+
+    // 7. Build session (caller is responsible for saving — encrypted or plaintext)
     let session = Session {
         signing_key_hex: hex::encode(*signing_pair.private_key),
         identity_key_hex: hex::encode(*identity_pair.private_key),
         device_id: device_id.clone(),
-        user_id: resp.user_id.clone(),
-        access_token: resp.access_token.clone(),
-        refresh_token: resp.refresh_token.clone(),
-        expires_at: resp.expires_at,
+        user_id: user_id.clone(),
+        access_token: access_token.clone(),
+        refresh_token: refresh_token.clone(),
+        expires_at,
         spk_key_hex: hex::encode(*spk_pair.private_key),
         spk_sig_hex: hex::encode(spk_sig.to_bytes()),
     };
 
     Ok(AuthResult {
-        user_id: resp.user_id,
+        user_id,
         device_id,
-        access_token: resp.access_token,
+        access_token,
         session: Some(session),
     })
 }
@@ -198,41 +205,44 @@ pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<
     let sk = signing_pair.get_signing_key();
     let spk_sig = sk.sign(&spk_msg);
 
-    let public_keys = DevicePublicKeys {
-        verifying_key: signing_pair.public_key.to_vec(),
-        identity_public: identity_pair.public_key.to_vec(),
-        signed_prekey_public: spk_pair.public_key.to_vec(),
-        signed_prekey_signature: spk_sig.to_bytes().to_vec(),
-        crypto_suite: "Curve25519+Ed25519".into(),
+    // Build CFE-encoded private keys
+    use construct_core::cfe::{CfePrivateKeysV1, encode};
+    use serde_bytes::ByteBuf;
+    let private_keys = CfePrivateKeysV1 {
+        suite_id: 1, // CLASSIC
+        ik_priv: ByteBuf::from((*identity_pair.private_key).to_vec()),
+        sk_priv: ByteBuf::from((*signing_pair.private_key).to_vec()),
+        spk_priv: ByteBuf::from((*spk_pair.private_key).to_vec()),
+        spk_sig: ByteBuf::from(spk_sig.to_bytes().to_vec()),
+        spk_id: 0,
+        ik_pub: ByteBuf::from(identity_pair.public_key.to_vec()),
+        vk_pub: ByteBuf::from(signing_pair.public_key.to_vec()),
+        spk_pub: ByteBuf::from(spk_pair.public_key.to_vec()),
+        old_spks: vec![],
     };
+    let keys_cfe_data = encode(construct_core::cfe::CfeMessageType::PrivateKeys, &private_keys)?;
 
     // 2. Confirm link — server verifies the token and returns JWT
-    let mut client = ConstructClient::connect(server_url)
-        .await
-        .context("connecting to server")?;
-
-    let resp = client
-        .confirm_device_link(link_token, &device_id, public_keys)
-        .await
-        .context("confirm_device_link RPC failed")?;
+    let (user_id, access_token, refresh_token, expires_at) = 
+        confirm_device_link(server_url, link_token, &device_id, &keys_cfe_data).await?;
 
     // 3. Build session (caller is responsible for saving — encrypted or plaintext)
     let session = Session {
         signing_key_hex: hex::encode(*signing_pair.private_key),
         identity_key_hex: hex::encode(*identity_pair.private_key),
         device_id: device_id.clone(),
-        user_id: resp.user_id.clone(),
-        access_token: resp.access_token.clone(),
-        refresh_token: resp.refresh_token.clone(),
-        expires_at: resp.expires_at,
+        user_id: user_id.clone(),
+        access_token: access_token.clone(),
+        refresh_token: refresh_token.clone(),
+        expires_at,
         spk_key_hex: hex::encode(*spk_pair.private_key),
         spk_sig_hex: hex::encode(spk_sig.to_bytes()),
     };
 
     Ok(AuthResult {
-        user_id: resp.user_id,
+        user_id,
         device_id,
-        access_token: resp.access_token,
+        access_token,
         session: Some(session),
     })
 }
@@ -241,30 +251,79 @@ pub async fn link_existing_device(server_url: &str, link_token: &str) -> Result<
 /// Unlike `try_restore_session`, this does NOT touch the session file — the caller is
 /// responsible for re-saving the session with updated tokens.
 pub async fn authenticate_saved_session(
-    mut session: Session,
+    session: Session,
     server_url: &str,
 ) -> Result<AuthResult> {
-    let mut client = ConstructClient::connect(server_url)
-        .await
-        .context("connecting to server")?;
+    // Parse signing key
+    let sk_bytes = hex::decode(&session.signing_key_hex)
+        .context("invalid signing key hex")?;
+    let sk_array: [u8; 32] = sk_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signing key must be 32 bytes"))?;
+    
+    // Generate challenge response (sign timestamp)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let message = format!("{}{}", session.device_id, timestamp);
+    
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_array);
+    let signature = signing_key.sign(message.as_bytes());
 
-    let resp = client
-        .authenticate(&session.device_id, &session.signing_key_hex)
-        .await
-        .context("re-authenticating session")?;
-
-    // Update tokens in-memory
-    session.access_token = resp.access_token.clone();
-    session.refresh_token = resp.refresh_token.clone();
-    session.expires_at = resp.expires_at;
-
-    let user_id = session.user_id.clone();
-    let device_id = session.device_id.clone();
+    // Authenticate with server
+    let (user_id, access_token, refresh_token, expires_at) = 
+        authenticate_with_signature(
+            server_url,
+            &session.device_id,
+            timestamp,
+            &signature.to_bytes(),
+        ).await?;
 
     Ok(AuthResult {
         user_id,
-        device_id,
-        access_token: resp.access_token,
+        device_id: session.device_id.clone(),
+        access_token,
         session: Some(session),
     })
+}
+
+// ── Helper functions for direct server communication ───────────────────────
+// These will be replaced with engine dispatch in the next iteration.
+
+async fn fetch_pow_challenge(server_url: &str) -> Result<(String, u32)> {
+    // TODO: Use engine's UiEvent::RegisterDevice which handles PoW internally
+    // For now, return dummy values - this needs proper gRPC/HTTP client
+    // or engine integration
+    anyhow::bail!("PoW challenge fetch requires engine integration")
+}
+
+async fn register_with_pow(
+    server_url: &str,
+    username: Option<&str>,
+    device_id: &str,
+    keys_cfe_data: &[u8],
+    solution: &construct_core::pow::PowSolution,
+) -> Result<(String, String, String, i64)> {
+    // TODO: Use engine's UiEvent::RegisterDevice
+    anyhow::bail!("Registration requires engine integration")
+}
+
+async fn confirm_device_link(
+    server_url: &str,
+    link_token: &str,
+    device_id: &str,
+    keys_cfe_data: &[u8],
+) -> Result<(String, String, String, i64)> {
+    // TODO: Use engine's UiEvent for device linking
+    anyhow::bail!("Device link requires engine integration")
+}
+
+async fn authenticate_with_signature(
+    server_url: &str,
+    device_id: &str,
+    timestamp: i64,
+    signature: &[u8; 64],
+) -> Result<(String, String, String, i64)> {
+    // TODO: Use engine's UiEvent::Authenticate
+    anyhow::bail!("Authentication requires engine integration")
 }

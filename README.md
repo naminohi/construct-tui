@@ -121,7 +121,7 @@ The binary is named `konstrukt` and is placed at `target/release/konstrukt`
 ## Run
 
 ```bash
-# Defaults — connects to https://construct.cc
+# Defaults — connects to https://konstruct.cc
 konstrukt
 
 # Override server

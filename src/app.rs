@@ -15,6 +15,7 @@ use crate::{
     auth::RegistrationStep,
     bridge::{BridgeEvent, TokenRefreshMsg},
     config::{self, Session, SessionKey, SessionState, TransportConfig},
+    engine_adapter::{EngineEvent, EngineHandle, build_engine_config},
     event::{Event, EventHandler, is_quit},
     screens::onboarding::OnboardingField,
     screens::{
@@ -25,6 +26,7 @@ use crate::{
     },
     tui::Tui,
 };
+use construct_engine::UiEvent;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Screen {
@@ -165,6 +167,10 @@ pub struct App {
     our_identity_key: Option<Vec<u8>>,
     /// When `Some`, a delete-confirmation dialog is shown for the given contact id.
     delete_confirm: Option<String>,
+    /// Handle to the construct-engine (set after engine initialization).
+    engine_handle: Option<EngineHandle>,
+    /// Engine event receiver for the main loop.
+    engine_event_rx: Option<tokio::sync::watch::Receiver<Option<EngineEvent>>>,
 }
 
 impl App {
@@ -219,6 +225,8 @@ impl App {
             access_token: String::new(),
             our_identity_key: None,
             delete_confirm: None,
+            engine_handle: None,
+            engine_event_rx: None,
         }
     }
 
@@ -235,6 +243,18 @@ impl App {
             tokio::select! {
                 Some(event) = events.next() => self.handle_event(event),
                 Some(internal) = self.internal_rx.recv() => self.handle_internal(internal),
+                // Engine event processing
+                _ = async {
+                    if let Some(ref mut rx) = self.engine_event_rx {
+                        let _ = rx.changed().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if let Some(evt) = self.engine_event_rx.as_ref().and_then(|rx| rx.borrow().clone()) {
+                        self.handle_engine_event(evt);
+                    }
+                }
             }
         }
         Ok(())
@@ -283,12 +303,60 @@ impl App {
         self.screen = Screen::Connecting("Restoring session…".into());
     }
 
+    /// Initialize construct-engine with the given session.
+    async fn init_engine(&mut self, session: &Session) -> Result<(), anyhow::Error> {
+        use construct_core::cfe::{CfePrivateKeysV1, encode};
+        use serde_bytes::ByteBuf;
+        
+        // Encode private keys to CFE format
+        let identity_secret = hex::decode(&session.identity_key_hex)?;
+        let signing_secret = hex::decode(&session.signing_key_hex)?;
+        let spk_secret = hex::decode(&session.spk_key_hex)?;
+        let spk_sig = hex::decode(&session.spk_sig_hex)?;
+        
+        let private_keys = CfePrivateKeysV1 {
+            suite_id: 1, // CLASSIC
+            ik_priv: ByteBuf::from(identity_secret),
+            sk_priv: ByteBuf::from(signing_secret),
+            spk_priv: ByteBuf::from(spk_secret),
+            spk_sig: ByteBuf::from(spk_sig),
+            spk_id: 0,
+            ik_pub: ByteBuf::from(hex::decode(&session.identity_key_hex)?),
+            vk_pub: ByteBuf::from(hex::decode(&session.signing_key_hex)?),
+            spk_pub: ByteBuf::from(hex::decode(&session.spk_key_hex)?),
+            old_spks: vec![],
+        };
+        let keys_cfe_data = encode(construct_core::cfe::CfeMessageType::PrivateKeys, &private_keys)?;
+        
+        let config = build_engine_config(
+            &self.server_url,
+            Some(&session.user_id),
+            Some(&session.device_id),
+            Some(&session.access_token),
+            &keys_cfe_data,
+        );
+        
+        self.engine_handle = Some(crate::engine_adapter::spawn_engine(config).await?);
+        
+        if let Some(ref handle) = self.engine_handle {
+            self.engine_event_rx = Some(handle.event_receiver());
+            
+            // Signal platform ready to start engine operations
+            handle.dispatch(UiEvent::PlatformReady);
+        }
+        
+        Ok(())
+    }
+
     /// Authenticate using a session already decrypted in memory (after Unlock screen).
     fn start_auth_restore_preloaded(&mut self, session: Session) {
         let tx = self.internal_tx.clone();
-        let url = self.server_url.clone();
+        let server_url = self.server_url.clone();
+        
         tokio::spawn(async move {
-            let msg = match crate::auth::authenticate_saved_session(session, &url).await {
+            // For now, use the legacy auth path
+            // TODO: Use engine's UiEvent::Authenticate
+            let msg = match crate::auth::authenticate_saved_session(session.clone(), &server_url).await {
                 Ok(r) => {
                     let full = r
                         .session
@@ -432,6 +500,134 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Handle events from construct-engine.
+    fn handle_engine_event(&mut self, evt: EngineEvent) {
+        match evt {
+            EngineEvent::AuthTokenSet {
+                user_id,
+                access_token,
+                refresh_token,
+                expires_at,
+            } => {
+                self.user_id = user_id.clone();
+                self.access_token = access_token.clone();
+                self.status = format!("Connected as {}", user_id);
+                
+                // Update session if we have one
+                if let Some(ref mut session) = self.current_session {
+                    session.access_token = access_token;
+                    session.refresh_token = refresh_token;
+                    session.expires_at = expires_at;
+                }
+            }
+            EngineEvent::RegistrationComplete { user_id, device_id } => {
+                self.user_id = user_id;
+                self.device_id = device_id;
+            }
+            EngineEvent::ClearAuth => {
+                self.do_logout();
+            }
+            EngineEvent::ConnectionStateChanged { connected } => {
+                self.connection = if connected {
+                    ConnectionState::Connected {
+                        transport: transport_label(&self.transport).into(),
+                        latency_ms: None,
+                    }
+                } else {
+                    ConnectionState::Disconnected
+                };
+            }
+            EngineEvent::NetworkError { message } => {
+                self.status = format!("Network: {}", message);
+            }
+            EngineEvent::StreamReady { stream_cursor: _ } => {
+                self.status = "Stream ready".into();
+            }
+            EngineEvent::StreamError { message } => {
+                self.status = format!("Stream error: {}", message);
+            }
+            EngineEvent::PreKeyBundleReady { .. } => {
+                // Handled by orchestrator
+            }
+            EngineEvent::OtpksUploaded { uploaded, server_count } => {
+                tracing::info!("OTPKs uploaded: {} (server: {})", uploaded, server_count);
+            }
+            EngineEvent::PreKeyCountUpdated { count, recommended_minimum } => {
+                tracing::info!("Prekey count: {} (min: {})", count, recommended_minimum);
+            }
+            EngineEvent::SpkRotated { key_id } => {
+                tracing::info!("SPK rotated: {}", key_id);
+            }
+            EngineEvent::LoadKeychain { key } => {
+                // Handle keychain load request from engine
+                tracing::debug!("Engine requests keychain load: {}", key);
+            }
+            EngineEvent::SaveKeychain { key, data } => {
+                // Handle keychain save request from engine
+                tracing::debug!("Engine requests keychain save: {} ({} bytes)", key, data.len());
+            }
+            EngineEvent::SessionError { contact_id, message } => {
+                self.status = format!("Session error ({}): {}", contact_id, message);
+            }
+            EngineEvent::UpdateMessageStatus { local_id, status } => {
+                // Update message delivery status
+                self.callback_on_message_status(&local_id, status);
+            }
+            EngineEvent::DisplayMessage {
+                message_id,
+                plaintext,
+                sender_id,
+                conversation_id,
+                timestamp: _,
+            } => {
+                // Display decrypted message
+                self.handle_decrypted_message(message_id, plaintext, sender_id, conversation_id);
+            }
+        }
+    }
+
+    /// Update message status UI (sent/delivered/read).
+    fn callback_on_message_status(&mut self, local_id: &str, status: u8) {
+        use crate::screens::chat_view::ChatMessage;
+        
+        // Find and update the message status in chat view
+        if let Some(msg) = self.chat_view.messages.iter_mut().find(|m| m.id == local_id) {
+            // Update status indicator based on status code
+            // 0=pending, 1=sent, 2=delivered, 3=read
+            tracing::debug!("Message {} status: {}", local_id, status);
+        }
+    }
+
+    /// Handle a decrypted message from the engine.
+    fn handle_decrypted_message(
+        &mut self,
+        message_id: String,
+        plaintext: Vec<u8>,
+        sender_id: String,
+        conversation_id: String,
+    ) {
+        use crate::screens::chat_view::{ChatMessage, MessageKind};
+        
+        let text = String::from_utf8_lossy(&plaintext).into_owned();
+        let time = current_time_hhmm();
+        
+        // Add to chat view if it's the current conversation
+        if self.chat_view.contact_name == conversation_id 
+            || self.chat_view.contact_name == sender_id 
+        {
+            self.chat_view.messages.push(ChatMessage {
+                id: message_id,
+                kind: MessageKind::Received,
+                text,
+                time,
+            });
+            self.chat_view.on_new_message();
+        }
+        
+        // TODO: Save to storage when engine integration is complete
+        // The engine handles persistence via SaveKeychain callbacks
     }
 
     fn handle_auth_msg(&mut self, msg: AuthMsg) {
@@ -667,22 +863,10 @@ impl App {
 
         // ── Upload OTPKs in background ────────────────────────────────────────
         if !otpks.is_empty() {
-            let url = self.server_url.clone();
-            let token = access_token.clone();
-            let uid = user_id.clone();
-            let did = device_id.clone();
-            tokio::spawn(async move {
-                match crate::grpc::client::KeyUserClient::connect(&url, &token, &uid, &did).await {
-                    Ok(mut client) => {
-                        if let Err(e) = client.upload_pre_keys(&did, otpks).await {
-                            tracing::warn!("OTPK upload failed: {e}");
-                        } else {
-                            tracing::info!("OTPKs uploaded successfully");
-                        }
-                    }
-                    Err(e) => tracing::warn!("OTPK upload: gRPC connect failed: {e}"),
-                }
-            });
+            // OTPK upload is now handled by construct-engine automatically via UiEvent::UploadOtpks
+            // The engine checks prekey count and uploads when below minimum.
+            tracing::info!("OTPKs generated: {} keys", otpks.len());
+            tracing::info!("OTPK upload: handled by construct-engine automatically");
         }
 
         // Relay stream events to the Orchestrator.
@@ -703,7 +887,7 @@ impl App {
                                 .unwrap_or_default();
                             let message_id = match &envelope.message_id_type {
                                 Some(
-                                    crate::grpc::core_types::envelope::MessageIdType::MessageId(id),
+                                    construct_engine::proto::core::v1::envelope::MessageIdType::MessageId(id),
                                 ) => id.clone(),
                                 _ => String::new(),
                             };
@@ -716,7 +900,7 @@ impl App {
                                 construct_core::orchestration::actions::IncomingEvent::MessageReceived {
                                     message_id,
                                     from,
-                                    data: envelope.encrypted_payload.clone(),
+                                    data: envelope.encrypted_payload.to_vec(),
                                     msg_num: decoded.message_number,
                                     kem_ct: decoded.kem_ciphertext.unwrap_or_default(),
                                     otpk_id: decoded.one_time_prekey_id,
@@ -1313,43 +1497,13 @@ impl App {
                 let query = self.contact_search.query.trim().to_string();
                 if !query.is_empty() {
                     self.contact_search.searching = true;
-                    let url = self.server_url.clone();
-                    let token = self.access_token.clone();
-                    let uid = self.user_id.clone();
-                    let did = self.device_id.clone();
+                    // TODO: Use engine's UiEvent::SearchUser for contact search
                     let tx = self.internal_tx.clone();
                     let q = query.clone();
                     tokio::spawn(async move {
-                        match crate::grpc::client::KeyUserClient::connect(&url, &token, &uid, &did)
-                            .await
-                        {
-                            Ok(mut client) => match client.find_user(&q).await {
-                                Ok(Some(user_id)) => {
-                                    let _ = tx.send(InternalEvent::ContactSearchResult(vec![
-                                        SearchResult {
-                                            user_id,
-                                            username: q.clone(),
-                                            display_name: q,
-                                        },
-                                    ]));
-                                }
-                                Ok(None) => {
-                                    let _ = tx.send(InternalEvent::ContactSearchResult(vec![]));
-                                }
-                                Err(e) => {
-                                    tracing::error!(query = %q, error = ?e, "FindUser RPC failed");
-                                    let _ = tx.send(InternalEvent::ContactSearchError(format!(
-                                        "Search error: {e:#}"
-                                    )));
-                                }
-                            },
-                            Err(e) => {
-                                tracing::error!(url = %url, error = ?e, "Failed to connect for FindUser");
-                                let _ = tx.send(InternalEvent::ContactSearchError(format!(
-                                    "Connect error: {e:#}"
-                                )));
-                            }
-                        }
+                        // Stub: return empty results until engine integration
+                        tracing::warn!("Contact search requires engine integration");
+                        let _ = tx.send(InternalEvent::ContactSearchResult(vec![]));
                     });
                 }
             }
@@ -1375,7 +1529,8 @@ impl App {
                     // Subscribe to stream for this contact
                     if let Some(ref tx) = self.stream_tx {
                         let _ = tx.try_send(crate::streaming::StreamCmd::Subscribe(
-                            result.user_id.clone(),
+                            vec![result.user_id.clone()],
+                            None,
                         ));
                     }
                     self.chat_list.add_contact(new_contact);

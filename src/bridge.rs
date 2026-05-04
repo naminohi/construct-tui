@@ -127,7 +127,7 @@ impl TuiBridge {
 
     /// Subscribe the stream worker to a peer's updates.
     pub fn subscribe(&self, user_id: String) {
-        let _ = self.stream_tx.try_send(StreamCmd::Subscribe(user_id));
+        let _ = self.stream_tx.try_send(StreamCmd::Subscribe(vec![user_id], None));
     }
 }
 
@@ -232,37 +232,9 @@ async fn do_refresh(
     device_id: &str,
     refresh_token: &str,
 ) -> Result<TokenRefreshMsg> {
-    use crate::grpc::shared::proto::services::v1::{
-        RefreshTokenRequest, auth_service_client::AuthServiceClient,
-    };
-    use tonic::{
-        Request,
-        transport::{ClientTlsConfig, Endpoint},
-    };
-
-    let tls = ClientTlsConfig::new().with_native_roots();
-    let channel = Endpoint::from_shared(server_url.to_string())
-        .context("invalid server URL")?
-        .tls_config(tls)?
-        .connect()
-        .await
-        .context("gRPC connect for token refresh")?;
-
-    let mut client = AuthServiceClient::new(channel);
-    let resp = client
-        .refresh_token(Request::new(RefreshTokenRequest {
-            refresh_token: refresh_token.to_owned(),
-            device_id: device_id.to_owned(),
-        }))
-        .await
-        .context("RefreshToken RPC")?
-        .into_inner();
-
-    Ok(TokenRefreshMsg::Refreshed {
-        access_token: resp.access_token,
-        refresh_token: resp.refresh_token.unwrap_or_default(),
-        expires_at: resp.expires_at,
-    })
+    // TODO: Use engine's UiEvent::RefreshToken for token refresh
+    // For now, return an error to indicate this needs engine integration
+    anyhow::bail!("Token refresh requires engine integration — dispatch UiEvent::RefreshToken")
 }
 
 fn now_unix_secs() -> i64 {

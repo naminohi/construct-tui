@@ -8,30 +8,35 @@ name = "konstrukt"
 path = "src/main.rs"
 
 [features]
-default = ["ice", "post-quantum"]
-ice = ["construct-ice"]
+default = ["post-quantum"]
 post-quantum = ["construct-core/post-quantum"]
 
 [dependencies]
-construct-core = { git = "https://github.com/maximeliseyev/construct-core.git", rev = "8085cf2", features = ["desktop"] }
-construct-ice = { git = "https://github.com/maximeliseyev/construct-obfs4.git", rev = "4657fca", optional = true, features = ["tonic-transport"] }
+# Core engine — provides QUIC/H3/gRPC transport + crypto orchestration
+construct-engine = { path = "../construct-engine" }
+construct-core = { path = "../construct-core" }
+
+# TUI
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
+
+# Error handling & utilities
 anyhow = "1"
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 
-# gRPC / proto
-tonic = { version = "0.14", features = ["transport", "tls-native-roots"] }
-prost = "0.14"
-tonic-prost = "0.14"
+# Protobuf codec (for envelope encoding)
+prost = "0.13"
 
 # Config & storage
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
 dirs = "5"
 
 # Session encryption at-rest
@@ -41,10 +46,6 @@ zeroize = { version = "1", features = ["std"] }
 
 # Message storage — SQLCipher
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
-
-# TLS/encryption backend for rustls
-ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Key derivation domain separation
 hkdf = "0.12"
@@ -62,8 +63,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2.4"
 
 [build-dependencies]
-prost-build = "0.14"
-tonic-prost-build = "0.14"
+prost-build = "0.13"
 
 [profile.release]
 opt-level = "s"
